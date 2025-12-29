@@ -10,20 +10,22 @@ const API_BASE = "http://127.0.0.1:8000";
 const Dashboard = () => {
   const [notes, setNotes] = useState([]);
   const [activeNote, setActiveNote] = useState(null);
-
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
-
+  const [bufferText, setBufferText] = useState(""); 
   const [recording, setRecording] = useState(false);
   const [audioBlob, setAudioBlob] = useState(null);
   const [audioURL, setAudioURL] = useState("");
+  const [transcribing, setTranscribing] = useState(false);
 
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
+  const wsRef = useRef(null);
+  const quillRef = useRef(null); // <-- new ref
 
   const token = localStorage.getItem("access_token");
 
-  /* ================= FETCH NOTES ================= */
+  //  FETCH NOTES 
   const fetchNotes = async () => {
     try {
       const res = await axios.get(`${API_BASE}/notes/get`, {
@@ -44,16 +46,15 @@ const Dashboard = () => {
     fetchNotes();
   }, []);
 
-  /* ================= SELECT NOTE ================= */
   const selectNote = (note) => {
     setActiveNote(note);
     setTitle(note.title);
     setContent(note.content || "");
+    setBufferText("");
     setAudioBlob(null);
     setAudioURL(note.voice_message || "");
   };
 
-  /* ================= SAVE / UPDATE ================= */
   const saveNote = async () => {
     if (!title.trim()) {
       toast.warning("Title required");
@@ -68,15 +69,11 @@ const Dashboard = () => {
     try {
       let res;
       if (activeNote) {
-        // UPDATE
-        res = await axios.put(
-          `${API_BASE}/notes/update/${activeNote.id}`,
-          formData,
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
+        res = await axios.put(`${API_BASE}/notes/update/${activeNote.id}`, formData, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
         toast.success("Note updated successfully");
       } else {
-        // CREATE
         res = await axios.post(`${API_BASE}/notes/create`, formData, {
           headers: { Authorization: `Bearer ${token}` },
         });
@@ -84,8 +81,6 @@ const Dashboard = () => {
       }
 
       const savedNote = res.data;
-
-      // Update sidebar
       setNotes((prev) => {
         const index = prev.findIndex((n) => n.id === savedNote.id);
         if (index !== -1) {
@@ -96,10 +91,10 @@ const Dashboard = () => {
         return [savedNote, ...prev];
       });
 
-      // Update active note fields
       setActiveNote(savedNote);
       setTitle(savedNote.title);
       setContent(savedNote.content || "");
+      setBufferText("");
       setAudioBlob(null);
       setAudioURL(savedNote.voice_message || "");
     } catch (error) {
@@ -108,7 +103,6 @@ const Dashboard = () => {
     }
   };
 
-  /* ================= DELETE ================= */
   const deleteNote = async (id) => {
     try {
       await axios.delete(`${API_BASE}/notes/delete/${id}`, {
@@ -118,6 +112,7 @@ const Dashboard = () => {
       setActiveNote(null);
       setTitle("");
       setContent("");
+      setBufferText("");
       setAudioBlob(null);
       setAudioURL("");
       toast.success("Note deleted");
@@ -127,7 +122,6 @@ const Dashboard = () => {
     }
   };
 
-  /* ================= RECORD AUDIO ================= */
   const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -136,7 +130,6 @@ const Dashboard = () => {
       audioChunksRef.current = [];
 
       recorder.ondataavailable = (e) => audioChunksRef.current.push(e.data);
-
       recorder.onstop = () => {
         const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
         setAudioBlob(blob);
@@ -156,12 +149,88 @@ const Dashboard = () => {
     if (mediaRecorderRef.current) mediaRecorderRef.current.stop();
   };
 
-  /* ================= UI ================= */
+  // ================== LIVE VOICE-TO-TEXT ==================
+  const startTranscription = () => {
+    if (transcribing) return;
+
+    wsRef.current = new WebSocket(`ws://127.0.0.1:8000/voice/ws?token=${token}`);
+
+    wsRef.current.onopen = () => {
+      console.log("Connected to Vosk WebSocket");
+      setTranscribing(true);
+    };
+
+    wsRef.current.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        if (!data.text) return;
+
+        if (data.final) {
+          setContent((prev) => {
+            const updated = prev ? prev + " " + data.text : data.text;
+            setTimeout(() => moveCursorToEnd(), 0); //  move cursor after render
+            return updated;
+          });
+          setBufferText("");
+        } else {
+          setContent((prev) => {
+            const withoutBuffer = prev.replace(bufferText, "");
+            const updated = withoutBuffer + data.text;
+            setTimeout(() => moveCursorToEnd(), 0); // <-- move cursor after render
+            return updated;
+          });
+          setBufferText(data.text);
+        }
+      } catch {
+        const newChunk = event.data.trim();
+        if (!newChunk) return;
+        setContent((prev) => {
+          const updated = prev ? prev + " " + newChunk : newChunk;
+          setTimeout(() => moveCursorToEnd(), 0);
+          return updated;
+        });
+      }
+    };
+
+    wsRef.current.onclose = () => {
+      console.log("WebSocket closed");
+      setTranscribing(false);
+      setBufferText("");
+    };
+
+    wsRef.current.onerror = (err) => {
+      console.error("WebSocket error", err);
+      toast.error("WebSocket connection failed. Check token or server.");
+      setTranscribing(false);
+      setBufferText("");
+    };
+  };
+
+  const stopTranscription = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+      setTranscribing(false);
+      setBufferText("");
+      console.log("Live transcription stopped");
+    }
+  };
+
+  //  MOVE CURSOR TO END 
+  const moveCursorToEnd = () => {
+    const editor = quillRef.current?.getEditor();
+    if (editor) {
+      const length = editor.getLength();
+      editor.setSelection(length, length);
+    }
+  };
+
+  // UI 
   return (
     <div className="flex h-screen">
       <ToastContainer position="top-right" autoClose={2000} />
 
-      {/* SIDEBAR */}
       <div className="w-64 bg-gray-900 text-white p-4">
         <button
           className="w-full bg-blue-600 p-2 mb-3"
@@ -169,6 +238,7 @@ const Dashboard = () => {
             setActiveNote(null);
             setTitle("");
             setContent("");
+            setBufferText("");
             setAudioBlob(null);
             setAudioURL("");
           }}
@@ -187,7 +257,6 @@ const Dashboard = () => {
         ))}
       </div>
 
-      {/* MAIN */}
       <div className="flex-1 p-5">
         <input
           className="border p-2 w-full mb-3"
@@ -196,30 +265,47 @@ const Dashboard = () => {
           onChange={(e) => setTitle(e.target.value)}
         />
 
-        <ReactQuill value={content} onChange={setContent} />
-
-        {/* RECORDING CONTROLS */}
-        <div className="mt-4">
-          {!recording ? (
-            <button
-              onClick={startRecording}
-              className="bg-green-600 text-white px-4 py-2 mr-3"
-            >
-              Start Recording
-            </button>
-          ) : (
-            <button
-              onClick={stopRecording}
-              className="bg-red-600 text-white px-4 py-2 mr-3"
-            >
-              Stop Recording
-            </button>
-          )}
-
-          {audioURL && (
-            <audio key={audioURL} controls src={audioURL} className="mt-3 w-full" />
-          )}
+        <div className="relative mb-4">
+          <ReactQuill
+            ref={quillRef} // <-- attach ref
+            value={content}
+            onChange={setContent}
+            placeholder="Type or speak here..."
+            className="border rounded-lg"
+            style={{ minHeight: "200px" }}
+          />
+          <button
+            onClick={transcribing ? stopTranscription : startTranscription}
+            className={`absolute right-3 top-1 p-2 rounded-full text-white shadow-lg ${
+              transcribing ? "bg-red-600" : "bg-green-600"
+            }`}
+            title={transcribing ? "Stop Transcription" : "Start Transcription"}
+          >
+            {transcribing ? "🎤" : "🎙️"}
+          </button>
         </div>
+
+        <div className="mt-2">
+  {!recording ? (
+    <button
+      onClick={startRecording}
+      className="bg-green-600 text-white px-4 py-2 mr-3"
+    >
+      {audioBlob || audioURL ? "Update Recording" : "Start Recording"}
+    </button>
+  ) : (
+    <button
+      onClick={stopRecording}
+      className="bg-red-600 text-white px-4 py-2 mr-3"
+    >
+      Stop Recording
+    </button>
+  )}
+
+  {audioURL && (
+    <audio key={audioURL} controls src={audioURL} className="mt-3 w-full" />
+  )}
+</div>
 
         <button
           onClick={saveNote}
